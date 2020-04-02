@@ -210,7 +210,7 @@ func newPodForCR(cr *presentationv1alpha1.Presentation) *corev1.Pod {
 			Containers: []corev1.Container{
 				{
 					Name:  "slides",
-					Image: "quay.io/hupiper/presentation",
+					Image: "hupiper/presentation",
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:      volumeName,
