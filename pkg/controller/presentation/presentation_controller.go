@@ -100,40 +100,106 @@ func (r *ReconcilePresentation) Reconcile(request reconcile.Request) (reconcile.
 		return reconcile.Result{}, err
 	}
 
+	configMapChanged, err := r.ensureLatestConfigMap(instance)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	err = r.ensureLatestPod(instance, configMapChanged)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{}, nil
+}
+
+func (r *ReconcilePresentation) ensureLatestConfigMap(instance *presentationv1alpha1.Presentation) (bool, error) {
+	configMap := newConfigMap(instance)
+
+	// Set Presentation instance as the owner and controller
+	if err := controllerutil.SetControllerReference(instance, configMap, r.scheme); err != nil {
+		return false, err
+	}
+
+	// Check if this ConfigMap already exists
+	foundMap := &corev1.ConfigMap{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Name: configMap.Name, Namespace: configMap.Namespace}, foundMap)
+	if err != nil && errors.IsNotFound(err) {
+		err = r.client.Create(context.TODO(), configMap)
+		if err != nil {
+			return false, err
+		}
+	} else if err != nil {
+		return false, err
+	}
+
+	if foundMap.Data["slides.md"] != configMap.Data["slides.md"] {
+		err = r.client.Update(context.TODO(), configMap)
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func (r *ReconcilePresentation) ensureLatestPod(instance *presentationv1alpha1.Presentation, configMapChanged bool) error {
 	// Define a new Pod object
 	pod := newPodForCR(instance)
 
 	// Set Presentation instance as the owner and controller
 	if err := controllerutil.SetControllerReference(instance, pod, r.scheme); err != nil {
-		return reconcile.Result{}, err
+		return err
 	}
-
 	// Check if this Pod already exists
 	found := &corev1.Pod{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, found)
+	err := r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, found)
 	if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
 		err = r.client.Create(context.TODO(), pod)
 		if err != nil {
-			return reconcile.Result{}, err
+			return err
 		}
 
 		// Pod created successfully - don't requeue
-		return reconcile.Result{}, nil
+		return nil
 	} else if err != nil {
-		return reconcile.Result{}, err
+
+		return err
 	}
 
-	// Pod already exists - don't requeue
-	reqLogger.Info("Skip reconcile: Pod already exists", "Pod.Namespace", found.Namespace, "Pod.Name", found.Name)
-	return reconcile.Result{}, nil
+	if configMapChanged {
+		err = r.client.Delete(context.TODO(), found)
+		if err != nil {
+			return err
+		}
+		err = r.client.Create(context.TODO(), pod)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// newPodForCR returns a busybox pod with the same name/namespace as the cr
+func newConfigMap(cr *presentationv1alpha1.Presentation) *corev1.ConfigMap {
+	labels := map[string]string{
+		"app": cr.Name,
+	}
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cr.Name + "-config",
+			Namespace: cr.Namespace,
+			Labels:    labels,
+		},
+		Data: map[string]string{
+			"slides.md": cr.Spec.Markdown,
+		},
+	}
+}
+
+/// newPodForCR returns a busybox pod with the same name/namespace as the cr
 func newPodForCR(cr *presentationv1alpha1.Presentation) *corev1.Pod {
 	labels := map[string]string{
 		"app": cr.Name,
 	}
+	volumeName := cr.Name + "-config"
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cr.Name + "-pod",
@@ -143,9 +209,26 @@ func newPodForCR(cr *presentationv1alpha1.Presentation) *corev1.Pod {
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
 				{
-					Name:    "busybox",
-					Image:   "busybox",
-					Command: []string{"sleep", "3600"},
+					Name:  "slides",
+					Image: "quay.io/hupiper/presentation",
+					VolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      volumeName,
+							MountPath: "/config",
+						},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: volumeName,
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: cr.Name + "-config",
+							},
+						},
+					},
 				},
 			},
 		},
